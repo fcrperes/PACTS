@@ -3,7 +3,7 @@
 In this repository, we provide Python code that can be used to efficiently
 specify the Pauli-based computation (PBC) tree associated with a given input
 Clifford+$T$ quantum circuit. It uses the **Normal Form Theorem** formulated
-in our recent preprint [].
+in our recent preprint [https://arxiv.org/abs/2610.30315].
 
 The code uses different modules, each equipped with different classes, methods,
 and functions all of which are suitably documented for readability and
