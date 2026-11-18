@@ -1,3 +1,6 @@
+import re
+
+
 class Error(Exception):
     """Base class for other exceptions"""
     pass
@@ -34,7 +37,18 @@ class StabilizerInputError(Error):
 
     def __init__(
             self,
-            message="Compilation is unnecessary: input is a stabilizer circuit."
+            message="Compilation is unnecessary: input is a stabilizer circuit!"
+    ):
+        self.message = message
+        super().__init__(self.message)
+
+
+class MidCircuitMeasurementInputError(Error):
+    """Exception raised when a T gate appears after a measurement."""
+
+    def __init__(
+        self,
+        message="Invalid circuit form: T gates after measurements are not supported!"
     ):
         self.message = message
         super().__init__(self.message)
@@ -42,7 +56,7 @@ class StabilizerInputError(Error):
 
 class NonCliffordTGenInputError(Error):
     """Exception raised when the input circuit has operations other than the
-    ones from the {H, S, CNOT, T} generating set.
+    ones from the set {X, Z, H, S, Sdg, CX, CZ, T}.
     """
 
     def __init__(
@@ -93,7 +107,15 @@ class QuCirc():
                 f'{self.input_file_loc}{self.input_file_name}') as file_object:
             file_lines = list(file_object)
 
-        return [l for l in file_lines if l != '\n' and not l.startswith('//')]
+        circuit_data = []
+        for line in file_lines:
+            line = line.partition('//')[0]
+            for statement in line.split(';'):
+                statement = re.sub(r'\s*,\s*', ',', statement.strip())
+                if statement != '':
+                    circuit_data.append(statement + ';\n')
+
+        return circuit_data
 
     def verify_input_circuit(self):
         """This method evaluates whether or not the quantum circuit instance
@@ -135,6 +157,8 @@ class QuCirc():
                         circuit_operations.append(line)
 
             if line.startswith('t '):
+                if mmt_count > 0:
+                    raise MidCircuitMeasurementInputError()
                 t_count += 1
             elif line.startswith('measure '):
                 mmt_count += 1
@@ -172,12 +196,13 @@ class QuCirc():
                 if it == 2:
                     break
 
+        new_names = {qreg_name: 'q_stab[', creg_name: 'c_stab['}
+        pattern = re.compile(
+            rf'\b({re.escape(qreg_name)}|{re.escape(creg_name)})\[')
         it = 0
         while it < len(circuit_list):
-            circuit_list[it] = circuit_list[it].replace(
-                f'{qreg_name}[', 'q_stab[')
-            circuit_list[it] = circuit_list[it].replace(
-                f'{creg_name}[', 'c_stab[')
+            circuit_list[it] = pattern.sub(lambda m: new_names[m.group(1)],
+                                           circuit_list[it])
             it += 1
 
         return circuit_list, q_count, t_count, mmt_count

@@ -1,6 +1,5 @@
 import os
 import collections
-import copy
 import random
 import numpy as np
 
@@ -152,8 +151,11 @@ class Pauli_Operator():
             i (int): number of the control qubit.
             j (int): number of the target qubit.
         """
-        self.bin_vec[-1] = (self.bin_vec[-1] +
-                            self.bin_vec[i] * self.bin_vec[j]) % 2
+        self.bin_vec[-1] = (
+            self.bin_vec[-1] + self.bin_vec[i] * self.bin_vec[j] *
+            (self.bin_vec[i + int(
+                (self.nr_columns - 1) / 2)] + self.bin_vec[j + int(
+                    (self.nr_columns - 1) / 2)])) % 2
         if self.bin_vec[i] == 1:
             self.bin_vec[j + int((self.nr_columns - 1) / 2)] = (
                 self.bin_vec[j + int((self.nr_columns - 1) / 2)] + 1) % 2
@@ -720,6 +722,41 @@ def cancel(lst):
     return cancelled
 
 
+def merge_signs(signs1, signs2, correlats2, reassign):
+    """This function merges the sign dependences found in a new compilation
+    round, i.e., signs2, into the sign dependences accumulated in all previous
+    rounds, captured in signs1.
+
+    Args:
+        signs1 (dict): sign dependences accumulated in the previous rounds.
+        signs2 (dict): sign dependences found in the present round, as returned
+        by `compile_branch()`.
+        correlats2 (dict): outcome correlations found in the new round, as
+        returned by `compile_branch()`.
+        reassign (list): reassign[i] is the measurement number of the Pauli at
+        the ith position of the list passed to `compile_branch()`.
+
+    Returns:
+        dict: the updated `signs1`, with keys and entries given as measurement
+        numbers, each list sorted and with pairs of repeated entries removed
+        (see `cancel()`).
+    """
+    old = {key: list(val) for key, val in signs1.items()}
+    for i in range(len(reassign)):
+        extra = []
+        for j in signs2[i]:
+            extra += [reassign[j]] + old[reassign[j]]
+        for x in correlats2[i]:
+            if isinstance(x, int):
+                extra += old[reassign[x]]
+        signs1[reassign[i]] = old[reassign[i]] + extra
+
+    for key, val in signs1.items():
+        signs1[key] = cancel(val)
+
+    return signs1
+
+
 def full_zero_branch(circuit_list, q_count, t_count, nr_mmts):
     """This function finds the full PBC branch assuming that all gadget
     measurements yield the outcome zero.
@@ -849,6 +886,7 @@ def compile_branch(branch, q_count, t_count, n_gadgets=None):
                             correlats[count].append(gen_ind)
                             prod_P = Pauli_mult(q_count, prod_P,
                                                 pipc_Ps[q_count + i])
+                            signs[count] ^= signs[gen_ind]
                     if prod_P.bin_vec[-1] == current_Pauli.bin_vec[-1]:
                         correlats[count].append("+")
                     else:
@@ -872,8 +910,8 @@ def remove_free_qubits(branch, q_count, t_count):
     quantum circuit, does a first compilation (compressing the branch so that 
     the quantum computation acts only on the magic qubits), and then given the
     already compiled branch, assesses if there are additional (magic) qubits
-    that can be removed for free. If that is the case, a second compilation is
-    performed, compressing the quantum computation even further.
+    that can be removed for free. If that is the case, further compilations are
+    performed, compressing the quantum computation as much as possible.
 
     Args:
         branch (list[PauliOperators]): full zero branch of the PBC.
@@ -890,7 +928,7 @@ def remove_free_qubits(branch, q_count, t_count):
         anti-commuting readouts; (4) a dictionary that records which dependent
         Paulis depend on which quantum measurents (essential to fix the
         distribution when actually running the computation); (5) a list with
-        pseudo-outcomes; (6) a dictionary recording which magic qubit the Sdg
+        pseudo-outcomes; (6) a dictionary recording which magic qubit the S†
         gate associated with each gadget measurement must be acting on;
         (7) an integer corresponding to the "effective" number of stabilizer
         qubits.
@@ -899,7 +937,7 @@ def remove_free_qubits(branch, q_count, t_count):
     comp_branch1, types1, signs1, correlats1, pseudoutcomes1 = compile_branch(
         branch, q_count, t_count)
 
-    sdg_tracker = dict()  # To track where the Sdg gates should be applied
+    sdg_tracker = dict()  # To track where the S† gates should be applied
     n_true_new_gadgets = 0
     for i, val in enumerate(types1):
         if val == 'q' and i < t_count:
@@ -910,15 +948,8 @@ def remove_free_qubits(branch, q_count, t_count):
     # freely removed:
     free_mqubits = []
     for i in range(t_count):
-        count = 0
-        for Pauli in comp_branch1:
-            if Pauli.bin_vec[q_count + i] == 0:
-                count += 1
-
-        if count == len(comp_branch1):
+        if all(Pauli.bin_vec[q_count + i] == 0 for Pauli in comp_branch1):
             free_mqubits.append(i)
-            for Pauli in comp_branch1:
-                Pauli.h(q_count + i)
 
     # STEP 3. If there are no free qubits, return.
     if len(free_mqubits) == 0:
@@ -926,63 +957,69 @@ def remove_free_qubits(branch, q_count, t_count):
                 sdg_tracker, q_count)
 
     # STEP 4. If there *are* free magic qubits, do a second compilation step
-    # that removes those.
+    # that removes them. We note that the number of free magic qubits will be
+    # at least `len(free_mqubits)`, but it can be larger because the second
+    # compilation step could create new free virtual qubits. We account for
+    # that in our removal procedure, even if the effect is rare.
     else:
-        # STEP 4.1. `free_mqubits` identifies which of the magic qubits will be
-        # freely removed. This helps us to track down the correct position of
-        # the Sdg gates and update the `sdg_tracker` dict.
-        for i in free_mqubits:
-            for key, val in sdg_tracker.items():
-                if key > i:
-                    sdg_tracker[key] -= 1
-
-        # STEP 4.2. Reorder the qubits so that the free magic qubits are the
-        # first ones in the magic register. We will then increase q_count by
-        # the number of free magic qubits, making the stabilizer register
-        # effectively larger and the magic register effectively smaller.
-        count = q_count
-        for i in free_mqubits:
-            for Pauli in comp_branch1:
-                Pauli.bin_vec.insert(count, Pauli.bin_vec.pop(q_count + i))
-                Pauli.bin_vec.insert(
-                    count + q_count + t_count,
-                    Pauli.bin_vec.pop(2 * q_count + t_count + i))
-            count += 1
-
-        q_count = q_count + len(free_mqubits)
-        t_count = t_count - len(free_mqubits)
+        #current_branch = comp_branch1
         reassign = [re for re, val in enumerate(types1) if val == 'q']
+        while True:
+            # STEP 4.1. Look for magic qubits with no X/Y on it.
+            free_qbs = [
+                i for i in range(t_count) if all(
+                    Pauli.bin_vec[q_count + i] == 0 for Pauli in comp_branch1)
+            ]
+            if not free_qbs:
+                break
 
-        comp_branch2, types2, signs2, correlats2, pseudoutcomes2 = compile_branch(
-            comp_branch1, q_count, t_count, n_gadgets=n_true_new_gadgets)
+            for k, f0 in enumerate(free_qbs):
+                f = f0 - k  # current position of this free qubit
+                # STEP 4.2. The S† gates of the magic qubits after f move one
+                # position to the left.
+                for key, val in sdg_tracker.items():
+                    if val > f:
+                        sdg_tracker[key] -= 1
 
-        # We now need to update types1, signs1, correlats1, pseudoutcomes1
-        # based on types2, signs2, correlats2, pseudoutcomes2.
-        for i in range(len(comp_branch1)):
-            if types1[reassign[i]] != types2[i]:
+                # STEP 4.3. Hadamard on the free qubit, and move it to the
+                # front of the magic register. Later this qubit is made part of
+                # the stabilizer register and the size of the magic register is
+                # reduced by 1.
+                for Pauli in comp_branch1:
+                    Pauli.h(q_count + f)
+                    Pauli.bin_vec.insert(q_count,
+                                         Pauli.bin_vec.pop(q_count + f))
+                    Pauli.bin_vec.insert(
+                        2 * q_count + t_count,
+                        Pauli.bin_vec.pop(2 * q_count + t_count + f))
+                q_count += 1  # size of the stabilizer register is increased by 1
+                t_count -= 1  # size of the magic register is decreased by 1
+
+            # STEP 4.4. Recompile what is left and merge the information.
+            comp_branch2, types2, signs2, correlats2, pseudoutcomes2 = compile_branch(
+                comp_branch1, q_count, t_count, n_gadgets=n_true_new_gadgets)
+
+            for i in range(len(comp_branch1)):
                 types1[reassign[i]] = types2[i]
+                correlats1[reassign[i]] = correlats1[reassign[i]] + [
+                    reassign[x] if isinstance(x, int) else x
+                    for x in correlats2[i]
+                ]
+                pseudoutcomes1[reassign[i]] = (pseudoutcomes1[reassign[i]] +
+                                               pseudoutcomes2[i]) % 2
 
-            signs1[reassign[i]] = signs1[reassign[i]] + [
-                reassign[j] for j in signs2[i]
+            signs1 = merge_signs(signs1, signs2, correlats2, reassign)
+
+            # STEP 4.5. Bookkeeping for the next round.
+            for i in range(n_true_new_gadgets):
+                if types2[i] != 'q':
+                    sdg_tracker.pop(reassign[i], None)
+            n_true_new_gadgets = sum(1 for i in range(n_true_new_gadgets)
+                                     if types2[i] == 'q')
+            reassign = [
+                reassign[i] for i, val in enumerate(types2) if val == 'q'
             ]
-            correlats1[reassign[i]] = correlats1[reassign[i]] + [
-                reassign[x] if isinstance(x, int) else x for x in correlats2[i]
-            ]
-            pseudoutcomes1[reassign[i]] = (pseudoutcomes1[reassign[i]] +
-                                           pseudoutcomes2[i]) % 2
-
-        for key, val in signs1.items():
-            signs1[key] = cancel(val)
-
-        branchers = [
-            i for i, val in enumerate(types1)
-            if val == 'q' and i < (t_count + len(free_mqubits))
-        ]
-
-        track_keys = list(sdg_tracker.keys())
-        for key in track_keys:
-            if key not in branchers:
-                del sdg_tracker[key]
+            comp_branch1 = comp_branch2
 
         return (comp_branch2, types1, signs1, correlats1, pseudoutcomes1,
                 sdg_tracker, q_count)
@@ -1014,7 +1051,7 @@ def remove_virtual_qubits(branch, q_count, t_count, stab_decomp):
         anti-commuting readouts; (4) a dictionary that records which dependent
         Paulis depend on which quantum measurents (essential to fix the
         distribution when actually running the computation); (5) a list with
-        pseudo-outcomes; (6) a dictionary recording which magic qubit the Sdg
+        pseudo-outcomes; (6) a dictionary recording which magic qubit the S†
         gate associated with each gadget measurement must be acting on;
         (7) an integer corresponding to the "effective" number of stabilizer
         qubits.
@@ -1044,7 +1081,7 @@ def remove_virtual_qubits(branch, q_count, t_count, stab_decomp):
 
     new_tcount = t_count - (new_qcount - q_count)
 
-    for key, val in sdg_tracker.items():
+    for key, _ in sdg_tracker.items():
         sdg_tracker[key] -= len(stab_decomp)
 
     if len(stab_decomp) > new_tcount:
@@ -1064,17 +1101,13 @@ def remove_virtual_qubits(branch, q_count, t_count, stab_decomp):
             if types1[reassign[i]] == 'q':
                 del sdg_tracker[reassign[i]]
 
-        signs1[reassign[i]] = signs1[reassign[i]] + [
-            reassign[j] for j in signs2[i]
-        ]
         correlats1[reassign[i]] = correlats1[reassign[i]] + [
             reassign[x] if isinstance(x, int) else x for x in correlats2[i]
         ]
         pseudoutcomes1[reassign[i]] = (pseudoutcomes1[reassign[i]] +
                                        pseudoutcomes2[i]) % 2
 
-    for key, val in signs1.items():
-        signs1[key] = cancel(val)
+    signs1 = merge_signs(signs1, signs2, correlats2, reassign)
 
     branchers = [
         reassign[i] for i, val in enumerate(types2)
@@ -1268,15 +1301,11 @@ def naive_pbc_simulator(file_loc,
                 if p < nr_branchers:
                     # We are in the branching part of the circuit. We must make
                     # sure we run through the correct branch, with the correctly
-                    # placed S† gates in place. Hence, we need to read whether
-                    # there exist sign interdependencies.
+                    # placed S† gates in place.
+                    # Note that here there should be no sign dependences.
+                    # That's what the assertion is checking for.
+                    assert sgns[qu_mmts[p]] == []
                     signal = Pauli.bin_vec[-1]
-                    for k in sgns[p]:
-                        with qc.if_test(
-                            (cr[len(comp_branch0) - 1 - k],
-                             (comp_branch0[qu_mmts.index(k)].bin_vec[-1] + 1) %
-                             2)):
-                            signal = (signal + 1) % 2
 
                     with qc.if_test((cr[counter], (signal + 1) % 2)):
                         qc.sdg(qr[tracker[qu_mmts[p]]])
@@ -1548,15 +1577,11 @@ def naive_virtual_qubit_simulator(file_loc,
                     if p < nr_branchers:
                         # We are in the branching part of the circuit. We must
                         # make sure we run through the correct branch, with the
-                        # correctly placed S† gates in place. Hence, we need to
-                        # read whether there exist sign interdependencies.
+                        # correctly placed S† gates in place.
+                        # Note that here there should be no sign dependences.
+                        # That's what the assertion is checking for.
+                        assert sgns[qu_mmts[p]] == []
                         signal = Pauli.bin_vec[-1]
-                        for k in sgns[p]:
-                            with qc.if_test(
-                                (cr[len(comp_branch0) - 1 - k],
-                                 (comp_branch0[qu_mmts.index(k)].bin_vec[-1] +
-                                  1) % 2)):
-                                signal = (signal + 1) % 2
 
                         with qc.if_test((cr[counter], (signal + 1) % 2)):
                             qc.sdg(qr[tracker[qu_mmts[p]]])
